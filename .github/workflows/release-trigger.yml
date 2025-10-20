@@ -1,0 +1,392 @@
+name: 🔷 Databricks Release Trigger
+
+on:
+  push:
+    branches:
+      - 'release/uat'
+      - 'release/psup'
+      - 'release/prod'
+
+jobs:
+  detect-and-trigger:
+    name: 🔍 Detect Release & Trigger Deployment
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to find tags
+      
+      - name: Fetch All Tags
+        run: git fetch --tags --force
+      
+      - name: Detect Environment from Branch
+        id: environment
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║       DATABRICKS RELEASE BRANCH UPDATE DETECTED       ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🌿 Branch: $BRANCH"
+          echo "📝 Commit: ${GITHUB_SHA:0:7}"
+          echo "👤 Pushed by: ${{ github.actor }}"
+          echo ""
+          
+          case "$BRANCH" in
+            "release/uat")
+              ENVIRONMENT="uat"
+              echo "🎯 Environment: UAT"
+              ;;
+            "release/psup")
+              ENVIRONMENT="psup"
+              echo "🎯 Environment: Pre-Production"
+              ;;
+            "release/prod")
+              ENVIRONMENT="prod"
+              echo "🎯 Environment: Production"
+              ;;
+            *)
+              echo "❌ Unknown release branch: $BRANCH"
+              exit 1
+              ;;
+          esac
+          
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+      
+      - name: Find Latest Tag on This Branch
+        id: find_tag
+        run: |
+          BRANCH="${{ steps.environment.outputs.branch }}"
+          
+          echo "🔍 Searching for the latest SemVer tag on branch: $BRANCH"
+          echo ""
+          
+          # Find the most recent SemVer tag that is reachable from current HEAD
+          LATEST_TAG=$(git describe --tags --match '[0-9]*.[0-9]*.[0-9]*' --abbrev=0 HEAD 2>/dev/null || echo "")
+          
+          if [[ -z "$LATEST_TAG" ]]; then
+            echo "⚠️  No SemVer tag found on branch $BRANCH"
+            echo "This might be an initial branch creation or a commit without a tag."
+            echo "Deployment will be skipped."
+            echo "tag_found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "tag_found=true" >> $GITHUB_OUTPUT
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          
+          echo "✅ Found tag: $LATEST_TAG"
+          echo ""
+          
+          # Get tag details
+          TAG_SHA=$(git rev-parse "${LATEST_TAG}^{commit}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          
+          echo "📊 Tag Information:"
+          echo "  • Tag: $LATEST_TAG"
+          echo "  • Tag SHA: ${TAG_SHA:0:7}"
+          echo "  • HEAD SHA: ${HEAD_SHA:0:7}"
+          echo ""
+          
+          # Check if the tag is actually on this commit or reachable
+          if git merge-base --is-ancestor "$TAG_SHA" "$HEAD_SHA"; then
+            echo "✅ Tag is reachable from current HEAD"
+            echo "tag_reachable=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  Tag is not reachable from current HEAD"
+            echo "This shouldn't happen with proper promotion workflow"
+            echo "tag_reachable=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Validate Tag Format
+        if: steps.find_tag.outputs.tag_found == 'true'
+        id: validate
+        run: |
+          TAG="${{ steps.find_tag.outputs.tag }}"
+          
+          echo "🔍 Validating tag format: $TAG"
+          
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Invalid tag format: $TAG"
+            echo "   Expected format: MAJOR.MINOR.PATCH (e.g., 1.2.3)"
+            echo "   Deployment will be skipped."
+            echo "valid=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "✅ Tag format validated: $TAG"
+          echo "valid=true" >> $GITHUB_OUTPUT
+      
+      - name: Check if Already Deployed
+        if: steps.find_tag.outputs.tag_found == 'true' && steps.validate.outputs.valid == 'true'
+        id: check_deployed
+        run: |
+          TAG="${{ steps.find_tag.outputs.tag }}"
+          ENV="${{ steps.environment.outputs.environment }}"
+          BRANCH="${{ steps.environment.outputs.branch }}"
+          
+          echo "🔍 Checking if tag $TAG was already deployed to $ENV..."
+          
+          # Check if a deployment marker file exists (optional - for tracking)
+          MARKER_FILE=".github/deployments/${TAG}-${ENV}.marker"
+          
+          if [[ -f "$MARKER_FILE" ]]; then
+            echo "⚠️  Deployment marker found: $MARKER_FILE"
+            echo "Tag $TAG was likely already deployed to $ENV"
+            echo "Checking commit message to confirm..."
+            
+            # Check if the most recent commit is from the promote workflow
+            COMMIT_MSG=$(git log -1 --pretty=%B)
+            
+            if echo "$COMMIT_MSG" | grep -q "promote.*${TAG}.*to.*${BRANCH}"; then
+              echo "✅ This is a new promotion commit"
+              echo "Proceeding with deployment"
+              echo "already_deployed=false" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️  This appears to be a re-push of existing content"
+              echo "Skipping deployment to avoid duplicate deployment"
+              echo "already_deployed=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "✅ No deployment marker found"
+            echo "This appears to be a new deployment"
+            echo "already_deployed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Analyze Changes
+        if: |
+          steps.find_tag.outputs.tag_found == 'true' && 
+          steps.validate.outputs.valid == 'true' &&
+          steps.check_deployed.outputs.already_deployed == 'false'
+        id: changes
+        run: |
+          TAG="${{ steps.find_tag.outputs.tag }}"
+          
+          echo "📊 Analyzing Databricks changes in tag: $TAG"
+          echo ""
+          
+          # Try to find previous tag for comparison
+          PREV_TAG=$(git describe --tags --match '[0-9]*.[0-9]*.[0-9]*' --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          
+          if [[ -n "$PREV_TAG" ]]; then
+            echo "Comparing $PREV_TAG → $TAG"
+            echo ""
+            
+            # Analyze what changed
+            NOTEBOOKS_CHANGED=$(git diff --name-only "$PREV_TAG" "$TAG" | grep -c "^notebooks/" || echo 0)
+            JOBS_CHANGED=$(git diff --name-only "$PREV_TAG" "$TAG" | grep -c "^jobs/" || echo 0)
+            SCHEMAS_CHANGED=$(git diff --name-only "$PREV_TAG" "$TAG" | grep -c "^schemas/" || echo 0)
+            
+            echo "📝 Change Summary:"
+            echo "  • Notebooks: $NOTEBOOKS_CHANGED files"
+            echo "  • Jobs: $JOBS_CHANGED files"
+            echo "  • Schemas: $SCHEMAS_CHANGED files"
+            
+            echo "notebooks_changed=$NOTEBOOKS_CHANGED" >> $GITHUB_OUTPUT
+            echo "jobs_changed=$JOBS_CHANGED" >> $GITHUB_OUTPUT
+            echo "schemas_changed=$SCHEMAS_CHANGED" >> $GITHUB_OUTPUT
+          else
+            echo "Initial release - all components will be deployed"
+            echo "notebooks_changed=new" >> $GITHUB_OUTPUT
+            echo "jobs_changed=new" >> $GITHUB_OUTPUT
+            echo "schemas_changed=new" >> $GITHUB_OUTPUT
+          fi
+          echo ""
+      
+      - name: Generate Deployment Metadata
+        if: |
+          steps.find_tag.outputs.tag_found == 'true' && 
+          steps.validate.outputs.valid == 'true' &&
+          steps.check_deployed.outputs.already_deployed == 'false'
+        id: metadata
+        run: |
+          TAG="${{ steps.find_tag.outputs.tag }}"
+          ENV="${{ steps.environment.outputs.environment }}"
+          BRANCH="${{ steps.environment.outputs.branch }}"
+          
+          # Create deployment metadata
+          mkdir -p .github/deployments
+          
+          cat > .github/deployments/${TAG}-${ENV}.json << EOF
+          {
+            "tag": "$TAG",
+            "environment": "$ENV",
+            "branch": "$BRANCH",
+            "commit_sha": "${{ github.sha }}",
+            "triggered_by": "${{ github.actor }}",
+            "triggered_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+            "repository": "databricks-repo",
+            "workflow_run": "${{ github.run_id }}",
+            "changes": {
+              "notebooks": "${{ steps.changes.outputs.notebooks_changed }}",
+              "jobs": "${{ steps.changes.outputs.jobs_changed }}",
+              "schemas": "${{ steps.changes.outputs.schemas_changed }}"
+            }
+          }
+          EOF
+          
+          echo "✅ Deployment metadata generated"
+      
+      - name: Notify Orchestrator
+        if: |
+          steps.find_tag.outputs.tag_found == 'true' && 
+          steps.validate.outputs.valid == 'true' &&
+          steps.check_deployed.outputs.already_deployed == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_PAT }}
+          script: |
+            console.log('🎯 Triggering orchestrator deployment...');
+            console.log('');
+            
+            const payload = {
+              repository: 'databricks-repo',
+              version_tag: '${{ steps.find_tag.outputs.tag }}',
+              branch: '${{ steps.environment.outputs.branch }}',
+              environment: '${{ steps.environment.outputs.environment }}',
+              commit_sha: context.sha,
+              pusher: context.actor,
+              timestamp: new Date().toISOString(),
+              triggered_by_promotion: true,
+              change_summary: {
+                notebooks: '${{ steps.changes.outputs.notebooks_changed }}',
+                jobs: '${{ steps.changes.outputs.jobs_changed }}',
+                schemas: '${{ steps.changes.outputs.schemas_changed }}'
+              }
+            };
+            
+            console.log('📦 Deployment Payload:');
+            console.log(JSON.stringify(payload, null, 2));
+            console.log('');
+            
+            try {
+              // Send repository_dispatch event to orchestrator
+              await github.rest.repos.createDispatchEvent({
+                owner: context.repo.owner,
+                repo: 'etl-orchestrator-demo',
+                event_type: 'databricks-release',
+                client_payload: payload
+              });
+              
+              console.log('✅ Orchestrator notified successfully!');
+              console.log('');
+              console.log('🔗 Monitor deployment:');
+              console.log(`   https://github.com/${context.repo.owner}/etl-orchestrator-demo/actions`);
+              
+            } catch (error) {
+              core.setFailed(`Failed to notify orchestrator: ${error.message}`);
+            }
+      
+      - name: Create Deployment Marker
+        if: |
+          steps.find_tag.outputs.tag_found == 'true' && 
+          steps.validate.outputs.valid == 'true' &&
+          steps.check_deployed.outputs.already_deployed == 'false'
+        run: |
+          TAG="${{ steps.find_tag.outputs.tag }}"
+          ENV="${{ steps.environment.outputs.environment }}"
+          
+          # Create a marker file to track this deployment
+          mkdir -p .github/deployments
+          echo "Deployed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .github/deployments/${TAG}-${ENV}.marker
+          
+          echo "✅ Deployment marker created"
+      
+      - name: Summary
+        if: steps.find_tag.outputs.tag_found == 'true'
+        run: |
+          TAG="${{ steps.find_tag.outputs.tag }}"
+          ENV="${{ steps.environment.outputs.environment }}"
+          BRANCH="${{ steps.environment.outputs.branch }}"
+          ALREADY_DEPLOYED="${{ steps.check_deployed.outputs.already_deployed }}"
+          
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║     ORCHESTRATOR DEPLOYMENT TRIGGERED                 ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          if [[ "$ALREADY_DEPLOYED" == "true" ]]; then
+            echo "⚠️  Deployment Skipped (Already Deployed)"
+            echo ""
+            echo "Tag $TAG was already deployed to $ENV"
+            echo "This prevents duplicate deployments from re-pushes"
+          else
+            echo "🎯 Deployment Details:"
+            echo "  • Component: Databricks"
+            echo "  • Tag: $TAG"
+            echo "  • Branch: $BRANCH"
+            echo "  • Environment: $ENV"
+            echo ""
+            echo "📊 What will be deployed:"
+            echo "  • Databricks ONLY (independent deployment)"
+            echo "  • IDMC will NOT be deployed (no changes detected there)"
+            echo ""
+            echo "⏭️  Next Steps:"
+            echo "  1. Orchestrator receives deployment event"
+            echo "  2. Validates Databricks version tag"
+            echo "  3. Deploys ONLY Databricks to $ENV"
+            echo "  4. Runs Databricks-specific tests"
+            echo "  5. Generates deployment report"
+            echo ""
+            echo "🔗 Monitor Progress:"
+            echo "   https://github.com/${{ github.repository_owner }}/etl-orchestrator-demo/actions"
+          fi
+          echo ""
+          
+          # Add to GitHub Step Summary
+          echo "## 🚀 Databricks Deployment Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "$ALREADY_DEPLOYED" == "true" ]]; then
+            echo "### ⚠️ Deployment Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "Tag \`$TAG\` was already deployed to \`$ENV\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| **Component** | Databricks |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Tag** | \`$TAG\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Branch** | \`$BRANCH\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Environment** | \`$ENV\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Triggered by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📊 Change Summary" >> $GITHUB_STEP_SUMMARY
+            echo "- **Notebooks**: ${{ steps.changes.outputs.notebooks_changed }} changed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Jobs**: ${{ steps.changes.outputs.jobs_changed }} changed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Schemas**: ${{ steps.changes.outputs.schemas_changed }} changed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🎯 Deployment Strategy" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Databricks will be deployed independently" >> $GITHUB_STEP_SUMMARY
+            echo "⏭️ IDMC will NOT be deployed (no changes)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "🔗 [Monitor orchestrator deployment](https://github.com/${{ github.repository_owner }}/etl-orchestrator-demo/actions)" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: No Tag Found Summary
+        if: steps.find_tag.outputs.tag_found == 'false'
+        run: |
+          BRANCH="${{ steps.environment.outputs.branch }}"
+          
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║         NO DEPLOYABLE TAG FOUND                       ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "Branch: $BRANCH"
+          echo ""
+          echo "This push to $BRANCH does not contain a SemVer tag."
+          echo "No deployment will be triggered."
+          echo ""
+          echo "To trigger a deployment:"
+          echo "1. Use the promote-release.yml workflow to promote a tag"
+          echo "2. Ensure the tag follows SemVer format (e.g., 1.2.3)"
+          echo ""
+          
+          echo "## ℹ️ No Deployment Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "No SemVer tag found on branch \`$BRANCH\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To trigger deployment, promote a tag using the \`promote-release\` workflow." >> $GITHUB_STEP_SUMMARY
